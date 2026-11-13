@@ -8,6 +8,7 @@
 #include "LspClient.h"
 #include "WelcomeWindow.h"
 #include "GlassEffect.h"
+#include "MusicGlass.h"
 
 static EditorColors colors;
 static QColor windowBg("#10131e"), panelBg("#171b29"), iconColor("#a5b4d5");
@@ -76,6 +77,7 @@ public:
         auto *op = new QSpinBox; op->setRange(25,100); op->setSuffix(" %"); op->setValue(opacityPercent); form->addRow(QString::fromUtf8("Непрозрачность стекла"),op);
         auto *glassToggle = new ToggleSwitch; glassToggle->setAccessibleName(QString::fromUtf8("Прозрачная область кода")); glassToggle->setChecked(transparentEditor); form->addRow(QString::fromUtf8("Прозрачная область кода"), glassToggle);
         auto *anim = new QCheckBox(QString::fromUtf8("Плавный переход текста при Enter")); anim->setChecked(animateLines); form->addRow(anim);
+        auto *captureHint=new QLabel(QString::fromUtf8("Живое стекло скрывает окно из скриншотов и записи. Чтобы показать код, включи «Вид → Режим скриншота»: фон останется на паузе."));captureHint->setWordWrap(true);form->addRow(captureHint);
         scroll->setWidget(content); outer->addWidget(scroll); auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); outer->addWidget(buttons);
         connect(buttons,&QDialogButtonBox::accepted,this,[=]{fontSize=font->value();opacityPercent=op->value();animateLines=anim->isChecked();transparentEditor=glassToggle->isChecked();accept();}); connect(buttons,&QDialogButtonBox::rejected,this,&QDialog::reject);
     }
@@ -98,7 +100,7 @@ public:
         auto *split=new QSplitter; tree=new QTreeView; model=new QFileSystemModel(this); model->setFilter(QDir::AllDirs|QDir::Files|QDir::NoDotAndDotDot); tree->setModel(model); tree->setHeaderHidden(true); for(int i=1;i<4;++i) tree->hideColumn(i); tree->setMinimumWidth(180); tree->setMaximumWidth(520);
         auto *side=new QWidget; auto *sideLayout=new QVBoxLayout(side); sideLayout->setContentsMargins(12,15,8,10); auto *label=new QLabel(QString::fromUtf8("ПРОВОДНИК")); label->setObjectName("section"); sideLayout->addWidget(label); projectLabel=new QLabel(QString::fromUtf8("Открой папку проекта")); projectLabel->setWordWrap(true); projectLabel->setObjectName("muted"); sideLayout->addWidget(projectLabel); sideLayout->addWidget(tree); split->addWidget(side);
         tabs=new QTabWidget; tabs->setTabsClosable(true); tabs->setMovable(true); tabs->setDocumentMode(true); split->addWidget(tabs); split->setStretchFactor(1,1); split->setSizes({260,1100}); layout->addWidget(split,1); setCentralWidget(central);
-        status=new QLabel(QString::fromUtf8("Готово")); statusBar()->addPermanentWidget(status,1);
+        status=new QLabel(QString::fromUtf8("Готово")); statusBar()->addPermanentWidget(status,1); glassIndicator=new QLabel; statusBar()->addWidget(glassIndicator);
         lsp=new LspClient(this);
         connect(lsp,&LspClient::statusChanged,this,[this](const QString &s){status->setText(s);});
         connect(lsp,&LspClient::diagnosticsReceived,this,[this](const QString &path,const QJsonArray &items){ if(current() && current()->property("path").toString()==path) status->setText(QString::fromUtf8("clangd: диагностик — %1").arg(items.size())); });
@@ -108,7 +110,7 @@ public:
             const int revision=completionRevision, position=completionPosition;
             const QJsonObject list=value.toObject(), defaults=list.value("itemDefaults").toObject();
             const QJsonArray items=value.isArray()?value.toArray():list.value("items").toArray();
-            QMenu menu(this);
+            QMenu menu(this); observeMenu(&menu);
             int count=0;
             for(const auto &v:items){
                 const QJsonObject obj=v.toObject();
@@ -156,23 +158,72 @@ public:
         createMenus(); applyTheme(); newFile();
     }
 public:
-    void enableGlass(){glassActive=GlassEffect::applyGlass(this);applyTheme();}
+    void enableGlass(){
+        glassActive=GlassEffect::applyGlass(this);
+        applyTheme();
+        if(musicGlass) return;
+        musicGlass=new MusicGlass(this);
+        connect(musicGlass,&MusicGlass::frameAvailable,this,[this]{if(sampledGlassActive)update();});
+        connect(musicGlass,&MusicGlass::readyChanged,this,[this](bool ready){
+            if(ready && musicGlass && musicGlass->isActive() && musicGlass->isReady() && !sampledGlassActive){
+                if(!GlassEffect::applyGlass(this,false)){
+                    musicGlass->stop();glassActive=GlassEffect::applyGlass(this);applyTheme();
+                    status->setText(QString::fromUtf8("Не удалось переключить стекло PRO; используется системный эффект"));return;
+                }
+                sampledGlassActive=true;glassActive=true;glassIndicator->setText(QString::fromUtf8("Стекло PRO: окно скрыто из записи • Вид → Режим скриншота"));applyTheme();
+            }else if((!ready || !musicGlass || !musicGlass->isActive() || !musicGlass->isReady()) && sampledGlassActive){
+                sampledGlassActive=false;glassIndicator->clear();glassActive=GlassEffect::applyGlass(this);applyTheme();
+            }
+            update();
+        });
+        connect(musicGlass,&MusicGlass::errorOccurred,this,[this](const QString &message){status->setText(message);});
+        if(!musicGlass->start() && !musicGlass->errorString().isEmpty())status->setText(musicGlass->errorString());
+    }
     bool startNewProject(){newProject();return !projectPath.isEmpty();}
     bool startOpenProject(){openProject();return !projectPath.isEmpty();}
     bool startRecentProject(const QString &dir){if(!QFileInfo(dir).isDir()){QMessageBox::warning(QApplication::activeWindow(),QString::fromUtf8("Папка недоступна"),QString::fromUtf8("Папка проекта больше не найдена: ")+dir);return false;}setProject(dir);return true;}
 protected:
-    void closeEvent(QCloseEvent *event) override { while(tabs->count()) if(!closeTab(0)){event->ignore();return;} lsp->stop(); event->accept(); }
+    bool event(QEvent *event) override {
+        if(musicGlass && musicGlass->isActive() && event->type()==QEvent::WindowBlocked) musicGlass->suspendCapture(true);
+        if(musicGlass && musicGlass->isActive() && event->type()==QEvent::WindowUnblocked) QTimer::singleShot(80,this,[this]{if(musicGlass && musicGlass->isActive())musicGlass->suspendCapture(false);});
+        return QMainWindow::event(event);
+    }
+    void paintEvent(QPaintEvent *event) override {
+        QMainWindow::paintEvent(event);
+        if(sampledGlassActive && musicGlass){
+            const QImage frame=musicGlass->latestFrame();
+            if(!frame.isNull()){
+                QPainter painter(this);
+                painter.drawImage(rect(),frame);
+                QColor tint=windowBg;tint.setAlpha(qRound(opacityPercent*2.55));painter.fillRect(rect(),tint);
+            }
+        }
+    }
+    void closeEvent(QCloseEvent *event) override { while(tabs->count()) if(!closeTab(0)){event->ignore();return;} if(musicGlass)musicGlass->stop(); lsp->stop(); event->accept(); }
 private:
-    bool glassActive=false; QTreeView *tree; QFileSystemModel *model; QTabWidget *tabs; QLabel *status; QLabel *projectLabel; LspClient *lsp; QString projectPath; int completionId=-1; int completionRevision=-1; int completionPosition=-1; QPointer<CodeEditor> completionEditor;
+    bool glassActive=false; bool sampledGlassActive=false; MusicGlass *musicGlass=nullptr; QAction *snapshotAction=nullptr; QLabel *glassIndicator=nullptr; QTreeView *tree; QFileSystemModel *model; QTabWidget *tabs; QLabel *status; QLabel *projectLabel; LspClient *lsp; QString projectPath; int completionId=-1; int completionRevision=-1; int completionPosition=-1; QPointer<CodeEditor> completionEditor;
     CodeEditor *current() const {return qobject_cast<CodeEditor*>(tabs->currentWidget());}
+    void observeMenu(QMenu *menu){
+        connect(menu,&QMenu::aboutToShow,this,[this]{if(musicGlass && musicGlass->isActive())musicGlass->suspendCapture(true);});
+        connect(menu,&QMenu::aboutToHide,this,[this]{QTimer::singleShot(80,this,[this]{if(musicGlass && musicGlass->isActive())musicGlass->suspendCapture(false);});});
+    }
     void createMenus() {
-        auto *file=menuBar()->addMenu(QString::fromUtf8("Файл"));
+        auto *file=menuBar()->addMenu(QString::fromUtf8("Файл")); observeMenu(file);
         auto action=[this,file](const QString &name,const QKeySequence &shortcut,auto fn){auto *a=file->addAction(name); a->setShortcut(shortcut);connect(a,&QAction::triggered,this,fn);};
         action(QString::fromUtf8("Новый файл"),QKeySequence::New,[this]{newFile();}); action(QString::fromUtf8("Открыть файл…"),QKeySequence::Open,[this]{QString p=QFileDialog::getOpenFileName(this,QString::fromUtf8("Открыть файл"),projectPath);if(!p.isEmpty())openFile(p);});
         action(QString::fromUtf8("Создать проект…"),QKeySequence("Ctrl+Shift+N"),[this]{newProject();}); action(QString::fromUtf8("Открыть папку проекта…"),QKeySequence("Ctrl+Shift+O"),[this]{openProject();}); file->addSeparator(); action(QString::fromUtf8("Сохранить"),QKeySequence::Save,[this]{saveCurrent(false);}); action(QString::fromUtf8("Сохранить как…"),QKeySequence::SaveAs,[this]{saveCurrent(true);}); action(QString::fromUtf8("Закрыть вкладку"),QKeySequence::Close,[this]{closeTab(tabs->currentIndex());});
-        auto *edit=menuBar()->addMenu(QString::fromUtf8("Правка")); auto *find=edit->addAction(QString::fromUtf8("Найти…")); find->setShortcut(QKeySequence::Find); connect(find,&QAction::triggered,this,[this]{if(!current())return;bool ok=false;QString text=QInputDialog::getText(this,QString::fromUtf8("Поиск"),QString::fromUtf8("Найти:"),QLineEdit::Normal,{},&ok);if(ok&&!text.isEmpty()&&!current()->find(text)){current()->moveCursor(QTextCursor::Start);if(!current()->find(text))QMessageBox::information(this,QString::fromUtf8("Поиск"),QString::fromUtf8("Совпадений нет."));}});
+        auto *edit=menuBar()->addMenu(QString::fromUtf8("Правка")); observeMenu(edit); auto *find=edit->addAction(QString::fromUtf8("Найти…")); find->setShortcut(QKeySequence::Find); connect(find,&QAction::triggered,this,[this]{if(!current())return;bool ok=false;QString text=QInputDialog::getText(this,QString::fromUtf8("Поиск"),QString::fromUtf8("Найти:"),QLineEdit::Normal,{},&ok);if(ok&&!text.isEmpty()&&!current()->find(text)){current()->moveCursor(QTextCursor::Start);if(!current()->find(text))QMessageBox::information(this,QString::fromUtf8("Поиск"),QString::fromUtf8("Совпадений нет."));}});
         auto *complete=edit->addAction(QString::fromUtf8("Подсказки clangd"));complete->setShortcut(QKeySequence("Ctrl+Space"));connect(complete,&QAction::triggered,this,[this]{requestCompletion();});
-        auto *view=menuBar()->addMenu(QString::fromUtf8("Вид"));connect(view->addAction(QString::fromUtf8("Настройки оформления…")),&QAction::triggered,this,[this]{editSettings();});
+        auto *view=menuBar()->addMenu(QString::fromUtf8("Вид"));observeMenu(view);connect(view->addAction(QString::fromUtf8("Настройки оформления…")),&QAction::triggered,this,[this]{editSettings();});
+        snapshotAction=view->addAction(QString::fromUtf8("Режим скриншота (заморозить фон)"));snapshotAction->setCheckable(true);
+        snapshotAction->setToolTip(QString::fromUtf8("Включите, чтобы окно было видно на скриншотах и записи экрана."));
+        connect(snapshotAction,&QAction::toggled,this,[this](bool frozen){
+            if(!musicGlass || !musicGlass->freezeForScreenshot(frozen)){
+                const QSignalBlocker block(snapshotAction);snapshotAction->setChecked(musicGlass&&musicGlass->isFrozen());
+                status->setText(musicGlass && !musicGlass->errorString().isEmpty()?musicGlass->errorString():QString::fromUtf8("Фон ещё не готов к переключению режима снимка"));return;
+            }
+            status->setText(frozen?QString::fromUtf8("Режим скриншота: фон на паузе"):QString::fromUtf8("Живое стекло включено"));glassIndicator->setText(frozen?QString::fromUtf8("Режим скриншота: окно видно в записи"):QString::fromUtf8("Стекло PRO: окно скрыто из записи • Вид → Режим скриншота"));update();
+        });
     }
     void applyTheme(bool resetFont = false) {
         setWindowOpacity(glassActive?1.0:qMax(0.75,opacityPercent/100.0));
