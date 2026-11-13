@@ -240,8 +240,8 @@ void CodeEditor::lineNumberAreaPaintEvent(QPaintEvent *event) {
 }
 void CodeEditor::highlightCurrentLine() {
     QList<QTextEdit::ExtraSelection> selections;
-    if (!isReadOnly()) {
-        QTextEdit::ExtraSelection selection; QColor current = m_colors.currentLine; if (m_transparentBackground) current.setAlpha(150); selection.format.setBackground(current);
+    if (!isReadOnly() && !m_transparentBackground) {
+        QTextEdit::ExtraSelection selection; selection.format.setBackground(m_colors.currentLine);
         selection.format.setProperty(QTextFormat::FullWidthSelection, true);
         selection.cursor = textCursor(); selection.cursor.clearSelection(); selections.append(selection);
     }
