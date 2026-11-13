@@ -1,0 +1,21 @@
+# Packaged application versions and local builds
+/app*/
+/build*/
+/out/
+/CMakeUserPresets.json
+
+# Generated files and IDE state
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.user
+*.user.*
+*.suo
+*.log
+*.tmp
+*.obj
+*.o
+*.exe
+*.dll
+*.pdb
